@@ -2,7 +2,7 @@
   "name": "antigravity-quota-status",
   "displayName": "Antigravity Model Quota Indicator",
   "description": "Displays model quota usage, remaining percentage, and reset countdowns in the Antigravity IDE status bar for Windows, Linux, and macOS.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "decobeto",
   "license": "MIT",
   "icon": "icon.png",

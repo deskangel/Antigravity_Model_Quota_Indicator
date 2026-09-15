@@ -4,6 +4,83 @@ const util = require('util');
 
 const execAsync = util.promisify(exec);
 
+function isLanguageServerProcess(commandLine) {
+  return /language_server/i.test(commandLine) && /--csrf_token\s+[a-f0-9-]+/i.test(commandLine);
+}
+
+function getProcessAncestors(pid, processes) {
+  const ancestors = [];
+  const visited = new Set();
+  let currentPid = pid;
+
+  while (currentPid && !visited.has(currentPid)) {
+    visited.add(currentPid);
+    ancestors.push(currentPid);
+    const processInfo = processes.get(currentPid);
+    currentPid = processInfo ? processInfo.ppid : null;
+  }
+
+  return ancestors;
+}
+
+function findClosestRelatedProcess(processes, currentPid) {
+  const currentAncestors = getProcessAncestors(currentPid, processes);
+  const currentAncestorDepth = new Map(currentAncestors.map((pid, depth) => [pid, depth]));
+  const candidates = [];
+
+  for (const processInfo of processes.values()) {
+    if (processInfo.pid === currentPid || !isLanguageServerProcess(processInfo.commandLine)) {
+      continue;
+    }
+
+    const candidateAncestors = getProcessAncestors(processInfo.pid, processes);
+    const sharedAncestor = candidateAncestors.find(pid => currentAncestorDepth.has(pid));
+
+    // PID 0/1 are system roots and do not identify a particular IDE instance.
+    if (sharedAncestor === undefined || sharedAncestor <= 1) {
+      continue;
+    }
+
+    candidates.push({
+      processInfo,
+      score: currentAncestorDepth.get(sharedAncestor) + candidateAncestors.indexOf(sharedAncestor)
+    });
+  }
+
+  candidates.sort((a, b) => a.score - b.score);
+  return candidates[0]?.processInfo || null;
+}
+
+async function getProcessSnapshot() {
+  if (process.platform === 'win32') {
+    const { stdout } = await execAsync(
+      'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CommandLine | ConvertTo-Json -Compress"'
+    );
+    const parsed = JSON.parse(stdout.trim());
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    return items.reduce((processes, item) => {
+      if (item?.ProcessId) {
+        processes.set(Number(item.ProcessId), {
+          pid: Number(item.ProcessId),
+          ppid: Number(item.ParentProcessId) || null,
+          commandLine: item.CommandLine || ''
+        });
+      }
+      return processes;
+    }, new Map());
+  }
+
+  const { stdout } = await execAsync('ps -axo pid=,ppid=,command=');
+  return stdout.split('\n').reduce((processes, line) => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+    if (match) {
+      const pid = Number(match[1]);
+      processes.set(pid, { pid, ppid: Number(match[2]), commandLine: match[3] });
+    }
+    return processes;
+  }, new Map());
+}
+
 class QuotaService {
   constructor() {
     this.cachedPort = null;
@@ -12,69 +89,32 @@ class QuotaService {
   }
 
   /**
-   * Find running language_server process cross-platform (Windows, Linux, macOS)
-   * Extracts CSRF token and PID.
+   * Find the language_server related to this Extension Host's IDE process tree.
+   * Extracts CSRF token and PID without scanning unrelated IDE instances.
    */
   async discoverProcessInfo() {
-    let commandLine = '';
-    let pid = null;
-
-    if (process.platform === 'win32') {
-      try {
-        const { stdout } = await execAsync(
-          'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \\"Name LIKE \'%language_server%\'\\" | Select-Object ProcessId, CommandLine | ConvertTo-Json"'
-        );
-        if (stdout && stdout.trim()) {
-          const parsed = JSON.parse(stdout.trim());
-          const item = Array.isArray(parsed) ? parsed[0] : parsed;
-          if (item) {
-            commandLine = item.CommandLine || '';
-            pid = item.ProcessId;
-          }
-        }
-      } catch (err) {
-        // Fallback for wmic if powershell fails
-        try {
-          const { stdout } = await execAsync('wmic process where "name like \'%language_server%\'" get processid,commandline /format:list');
-          commandLine = stdout;
-          const pidMatch = stdout.match(/ProcessId=(\d+)/i);
-          if (pidMatch) pid = parseInt(pidMatch[1], 10);
-        } catch (e) {
-          console.error('[QuotaService] Error running wmic/powershell:', e);
-        }
-      }
-    } else {
-      // Linux / macOS process discovery
-      try {
-        const { stdout } = await execAsync('ps aux');
-        const lines = stdout.split('\n');
-        for (const line of lines) {
-          if (line.includes('language_server') && !line.includes('grep')) {
-            commandLine = line;
-            const parts = line.trim().split(/\s+/);
-            if (parts.length > 1 && !isNaN(parts[1])) {
-              pid = parseInt(parts[1], 10);
-            }
-            break;
-          }
-        }
-      } catch (e) {
-        console.error('[QuotaService] Error running ps:', e);
-      }
+    let processes;
+    try {
+      processes = await getProcessSnapshot();
+    } catch (err) {
+      console.error('[QuotaService] Error reading process tree:', err);
+      throw new Error('Could not inspect the IDE process tree.');
     }
 
-    if (!commandLine) {
-      throw new Error('Antigravity Language Server process not found.');
+    const processInfo = findClosestRelatedProcess(processes, process.pid);
+
+    if (!processInfo) {
+      throw new Error('Language Server for the current IDE process tree not found.');
     }
 
-    const tokenMatch = commandLine.match(/--csrf_token\s+([a-f0-9-]+)/i);
+    const tokenMatch = processInfo.commandLine.match(/--csrf_token\s+([a-f0-9-]+)/i);
     if (!tokenMatch) {
       throw new Error('CSRF token not found in Language Server process arguments.');
     }
 
     return {
       csrfToken: tokenMatch[1],
-      pid: pid
+      pid: processInfo.pid
     };
   }
 
